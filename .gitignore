@@ -1,0 +1,29 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*service-account*.json
+*credentials*.json
+token.json
+token.pickle
+client_secret*.json
+
+# Generated reports
+*.pdf
+*.xlsx
+*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
