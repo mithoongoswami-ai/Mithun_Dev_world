@@ -32,3 +32,17 @@ google-genai
 python-dotenv
 gradio
 reportlab
+
+google-adk
+google-auth
+google-cloud-bigquery
+google-cloud-discoveryengine
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+gradio
+python-dotenv
+matplotlib
+pandas
+reportlab
+Pillow
