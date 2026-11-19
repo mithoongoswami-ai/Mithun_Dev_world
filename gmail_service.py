@@ -64,19 +64,20 @@ def get_gmail_service():
     )
 
 
+
 def send_report_email(
     recipient: str,
     subject: str,
     body: str,
-    pdf_path: str,
+    attachment_path: str,
 ):
 
     if not recipient or "@" not in recipient:
         raise ValueError("Enter a valid recipient email address.")
 
-    if not os.path.isfile(pdf_path):
+    if not os.path.isfile(attachment_path):
         raise FileNotFoundError(
-            f"PDF report not found: {pdf_path}"
+            f"PDF report not found: {attachment_path}"
         )
 
     service = get_gmail_service()
@@ -88,20 +89,23 @@ def send_report_email(
 
     message.set_content(body)
 
-    with open(pdf_path, "rb") as attachment:
+    # Attach PDF report
+    with open(attachment_path, "rb") as attachment:
         pdf_data = attachment.read()
 
     message.add_attachment(
         pdf_data,
         maintype="application",
         subtype="pdf",
-        filename=os.path.basename(pdf_path),
+        filename=os.path.basename(attachment_path),
     )
 
+    # Encode email
     encoded_message = base64.urlsafe_b64encode(
         message.as_bytes()
     ).decode()
 
+    # Send email through Gmail API
     result = (
         service.users()
         .messages()
@@ -113,3 +117,4 @@ def send_report_email(
     )
 
     return result["id"]
+

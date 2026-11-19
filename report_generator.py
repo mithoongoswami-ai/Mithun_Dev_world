@@ -1,10 +1,12 @@
 
+import os
+import re
+import io
+import uuid
 from datetime import datetime
-from pathlib import Path
-from html import escape
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
@@ -15,204 +17,173 @@ from reportlab.platypus import (
     Table,
     TableStyle,
     Image,
-    KeepTogether,
+    PageBreak,
 )
 
 from report_renderer import chart_png_bytes
 
 
-REPORT_DIR = Path("generated_reports")
-REPORT_DIR.mkdir(parents=True, exist_ok=True)
+def safe_text(value):
+    if value is None:
+        return ""
 
-PAGE_SIZE = landscape(A4)
+    text = str(value)
+
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br/>")
+    )
 
 
 def build_styles():
     styles = getSampleStyleSheet()
 
     styles.add(ParagraphStyle(
-        name="ReportTitleCustom",
+        name="MRPTitle",
         parent=styles["Title"],
-        fontSize=21,
-        leading=26,
+        fontSize=20,
+        leading=25,
+        textColor=colors.HexColor("#17365D"),
         alignment=TA_LEFT,
-        textColor=colors.HexColor("#17365D"),
-        spaceAfter=10,
+        spaceAfter=8,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportHeadingCustom",
+        name="MRPSection",
         parent=styles["Heading2"],
-        fontSize=13,
-        leading=17,
+        fontSize=14,
+        leading=18,
         textColor=colors.HexColor("#17365D"),
-        spaceBefore=13,
-        spaceAfter=7,
-        keepWithNext=True,
+        spaceBefore=14,
+        spaceAfter=8,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportBodyCustom",
+        name="MRPBody",
         parent=styles["BodyText"],
-        fontSize=8.5,
-        leading=12,
+        fontSize=9,
+        leading=13,
         spaceAfter=6,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportBulletCustom",
+        name="MRPBullet",
         parent=styles["BodyText"],
-        fontSize=8.5,
-        leading=12,
+        fontSize=9,
+        leading=13,
         leftIndent=12,
         firstLineIndent=-8,
         spaceAfter=5,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportTableHeaderCustom",
+        name="MRPTableHeader",
         parent=styles["BodyText"],
-        fontSize=6.5,
-        leading=8,
+        fontSize=7,
+        leading=9,
         textColor=colors.white,
-        alignment=TA_CENTER,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportTableCellCustom",
+        name="MRPTableCell",
         parent=styles["BodyText"],
-        fontSize=6,
-        leading=7.5,
+        fontSize=6.5,
+        leading=8,
     ))
 
     return styles
 
 
-def text_paragraph(value, style):
-    if value is None:
-        value = "—"
-
-    if isinstance(value, (dict, list)):
-        value = str(value)
-
-    value = escape(str(value)).replace("\n", "<br/>")
-    return Paragraph(value, style)
-
-
-def add_heading(story, text, styles):
-    story.append(
-        Paragraph(
-            escape(str(text)),
-            styles["ReportHeadingCustom"]
-        )
-    )
-
-
 def add_bullets(story, items, styles):
+    if not items:
+        story.append(
+            Paragraph("No additional findings.", styles["MRPBody"])
+        )
+        return
+
     if isinstance(items, str):
         items = [items]
 
-    for item in items or []:
+    for item in items:
         story.append(
             Paragraph(
-                "&#8226;&nbsp;&nbsp;" +
-                escape(str(item)),
-                styles["ReportBulletCustom"]
+                "&#8226; " + safe_text(item),
+                styles["MRPBullet"]
             )
         )
 
 
-def create_pdf_table(table_data, styles):
-    if not isinstance(table_data, dict):
-        return None
-
-    columns = table_data.get("columns", [])
-    rows = table_data.get("rows", [])
-
-    if not columns:
+def create_dynamic_table(columns, rows, styles):
+    if not columns or not rows:
         return None
 
     data = [[
-        text_paragraph(column, styles["ReportTableHeaderCustom"])
+        Paragraph(safe_text(column), styles["MRPTableHeader"])
         for column in columns
     ]]
 
     for row in rows:
-        if isinstance(row, dict):
-            values = [row.get(column, "") for column in columns]
-        elif isinstance(row, (list, tuple)):
-            values = list(row)
-        else:
-            continue
+        cells = []
 
-        values = values[:len(columns)]
-        values += [""] * (len(columns) - len(values))
+        for column in columns:
+            if isinstance(row, dict):
+                value = row.get(column)
+            else:
+                try:
+                    value = row[columns.index(column)]
+                except (IndexError, TypeError, ValueError):
+                    value = None
 
-        data.append([
-            text_paragraph(value, styles["ReportTableCellCustom"])
-            for value in values
-        ])
+            cells.append(
+                Paragraph(safe_text(value), styles["MRPTableCell"])
+            )
 
-    available_width = PAGE_SIZE[0] - 24 * mm
-    column_width = available_width / len(columns)
+        data.append(cells)
 
-    result = Table(
+    page_width = landscape(A4)[0] - 25 * mm
+    col_width = page_width / len(columns)
+
+    table = Table(
         data,
-        colWidths=[column_width] * len(columns),
+        colWidths=[col_width] * len(columns),
         repeatRows=1,
-        splitByRow=1,
         hAlign="LEFT",
     )
 
-    result.setStyle(TableStyle([
+    table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17365D")),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9E2F3")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D9E2F3")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [
             colors.white,
-            colors.HexColor("#F4F7FB"),
+            colors.HexColor("#F3F6FA")
         ]),
     ]))
 
-    return result
+    return table
 
 
-def add_table_section(story, table_data, styles):
-    if not isinstance(table_data, dict):
-        return
-
-    title = table_data.get("title", "Consolidated Data")
-    add_heading(story, title, styles)
-
-    table = create_pdf_table(table_data, styles)
-
-    if table:
-        story.append(table)
-        story.append(Spacer(1, 8))
-
-
-def add_footer(canvas, document):
+def footer(canvas, document):
     canvas.saveState()
-
-    width, _ = PAGE_SIZE
-    canvas.setStrokeColor(colors.HexColor("#D9E2F3"))
-    canvas.line(12 * mm, 12 * mm, width - 12 * mm, 12 * mm)
 
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(colors.grey)
 
     canvas.drawString(
-        12 * mm,
+        13 * mm,
         8 * mm,
-        "SAP Inventory Intelligence | Confidential"
+        "SAP Inventory Intelligence | MRP Controller Report"
     )
 
     canvas.drawRightString(
-        width - 12 * mm,
+        landscape(A4)[0] - 13 * mm,
         8 * mm,
         f"Page {document.page}"
     )
@@ -220,154 +191,235 @@ def add_footer(canvas, document):
     canvas.restoreState()
 
 
-def generate_pdf_report(data):
-    if not isinstance(data, dict):
-        raise ValueError("Report data must be a dictionary.")
-
-    if data.get("retrieval_status") == "failed":
-        raise RuntimeError(
-            "Cannot generate a business report because "
-            "inventory data retrieval failed: "
-            + str(data.get("retrieval_error", "Unknown error"))
-        )
+def generate_pdf_report(report):
+    output_dir = "generated_reports"
+    os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pdf_path = REPORT_DIR / f"SAP_Inventory_Report_{timestamp}.pdf"
+
+    safe_title = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        str(report.get("report_title", "inventory_report"))
+    )[:45]
+
+    filename = (
+        f"{safe_title}_{timestamp}_{uuid.uuid4().hex[:6]}.pdf"
+    )
+
+    pdf_path = os.path.join(output_dir, filename)
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=landscape(A4),
+        rightMargin=12 * mm,
+        leftMargin=12 * mm,
+        topMargin=13 * mm,
+        bottomMargin=15 * mm,
+        title=str(report.get("report_title", "Inventory Report")),
+    )
 
     styles = build_styles()
     story = []
 
-    title = data.get("report_title", "SAP Inventory Report")
+    # -----------------------------------------------------
+    # TITLE AND REQUEST
+    # -----------------------------------------------------
 
-    # Title and report metadata
     story.append(Paragraph(
-        escape(str(title)),
-        styles["ReportTitleCustom"]
+        safe_text(report.get(
+            "report_title",
+            "SAP Inventory Intelligence Report"
+        )),
+        styles["MRPTitle"]
     ))
 
     story.append(Paragraph(
-        "SAP Inventory Intelligence | Generated: " +
-        datetime.now().strftime("%d %B %Y, %H:%M"),
-        styles["ReportBodyCustom"]
+        "Generated: " + safe_text(
+            report.get(
+                "generated_at",
+                datetime.now().strftime("%d %B %Y %H:%M")
+            )
+        ),
+        styles["MRPBody"]
     ))
 
-    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        "<b>User request:</b> " +
+        safe_text(report.get("user_query", "")),
+        styles["MRPBody"]
+    ))
 
-    # Report request
-    if data.get("user_query"):
-        add_heading(story, "1. Report Scope", styles)
-        story.append(text_paragraph(
-            data["user_query"],
-            styles["ReportBodyCustom"]
-        ))
+    story.append(Spacer(1, 5 * mm))
 
-    # Executive summary bullets
-    add_heading(story, "2. Executive Summary", styles)
+    # -----------------------------------------------------
+    # EXECUTIVE SUMMARY
+    # -----------------------------------------------------
+
+    story.append(Paragraph(
+        "Executive Summary",
+        styles["MRPSection"]
+    ))
+
     add_bullets(
         story,
-        data.get("executive_summary", []),
+        report.get("executive_summary", []),
         styles
     )
 
-    # Overall assessment
-    if data.get("generated_summary"):
-        add_heading(story, "3. Overall Assessment", styles)
-        story.append(text_paragraph(
-            data["generated_summary"],
-            styles["ReportBodyCustom"]
+    if report.get("generated_summary"):
+        story.append(Paragraph(
+            "Overall Assessment",
+            styles["MRPSection"]
         ))
 
-    # Charts
-    visualizations = data.get("visualizations", [])
-    chart_count = 0
+        story.append(Paragraph(
+            safe_text(report["generated_summary"]),
+            styles["MRPBody"]
+        ))
 
-    for chart in visualizations:
-        if not isinstance(chart, dict):
-            continue
+    # -----------------------------------------------------
+    # KPI SUMMARY
+    # -----------------------------------------------------
 
-        image_bytes = chart_png_bytes(chart)
+    summary = report.get("summary", {})
 
-        if not image_bytes:
-            continue
+    if summary:
+        story.append(Paragraph(
+            "Inventory KPI Summary",
+            styles["MRPSection"]
+        ))
 
-        chart_count += 1
-        add_heading(
-            story,
-            chart.get("title", f"Visualization {chart_count}"),
-            styles
+        kpi_data = [
+            ["Total materials", "Critical", "High risk", "Normal"],
+            [
+                str(summary.get("total_materials", 0)),
+                str(summary.get("critical_items", 0)),
+                str(summary.get("high_risk_items", 0)),
+                str(summary.get("normal_items", 0)),
+            ]
+        ]
+
+        kpi_table = Table(
+            kpi_data,
+            colWidths=[55 * mm] * 4
         )
 
-        import io
-        chart_image = Image(io.BytesIO(image_bytes))
-        chart_image._restrictSize(230 * mm, 125 * mm)
+        kpi_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17365D")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F3F6FA")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("PADDING", (0, 0), (-1, -1), 8),
+        ]))
 
-        story.append(chart_image)
+        story.append(kpi_table)
 
-        if chart.get("description"):
-            story.append(text_paragraph(
-                chart["description"],
-                styles["ReportBodyCustom"]
+    # -----------------------------------------------------
+    # CHARTS
+    # -----------------------------------------------------
+
+    charts = report.get("visualizations", [])
+
+    if charts:
+        story.append(Paragraph(
+            "Inventory Visual Analytics",
+            styles["MRPSection"]
+        ))
+
+        for chart in charts:
+            image_bytes = chart_png_bytes(chart)
+
+            if not image_bytes:
+                continue
+
+            story.append(Paragraph(
+                safe_text(chart.get("title", "Inventory Chart")),
+                styles["Heading3"]
             ))
 
-        story.append(Spacer(1, 8))
-
-    # Top-level consolidated table
-    if data.get("consolidated_table"):
-        add_table_section(
-            story,
-            data["consolidated_table"],
-            styles
-        )
-
-    # Dynamic report sections
-    for section in data.get("sections", []):
-        if not isinstance(section, dict):
-            continue
-
-        heading = section.get("heading", "Report Section")
-        add_heading(story, heading, styles)
-
-        if section.get("content"):
-            story.append(text_paragraph(
-                section["content"],
-                styles["ReportBodyCustom"]
-            ))
-
-        if section.get("table"):
-            add_table_section(
-                story,
-                section["table"],
-                styles
+            image = Image(
+                io.BytesIO(image_bytes),
+                width=230 * mm,
+                height=105 * mm,
+                kind="proportional"
             )
 
-    # Findings and actions
-    add_heading(story, "Key Findings", styles)
-    add_bullets(story, data.get("key_findings", []), styles)
+            story.append(image)
+            story.append(Spacer(1, 5 * mm))
 
-    add_heading(story, "Recommendations and Actions", styles)
-    add_bullets(story, data.get("recommendations", []), styles)
+    # -----------------------------------------------------
+    # INVENTORY TABLE
+    # -----------------------------------------------------
 
-    if data.get("data_limitations"):
-        add_heading(story, "Data Limitations and Assumptions", styles)
-        add_bullets(story, data["data_limitations"], styles)
+    inventory = report.get("inventory", [])
 
-    document = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=PAGE_SIZE,
-        rightMargin=12 * mm,
-        leftMargin=12 * mm,
-        topMargin=12 * mm,
-        bottomMargin=18 * mm,
-        title=str(title),
-        author="SAP Inventory Intelligence",
-        allowSplitting=1,
-    )
+    if inventory:
+        story.append(PageBreak())
 
-    document.build(
+        story.append(Paragraph(
+            "Consolidated Inventory Position",
+            styles["MRPSection"]
+        ))
+
+        columns = [
+            "material_number",
+            "plant",
+            "storage_location",
+            "base_uom",
+            "unrestricted_stock",
+            "safety_stock",
+            "blocked_stock",
+            "in_transit_stock",
+            "quality_inspection_stock",
+            "stock_value_eur",
+            "risk",
+        ]
+
+        table = create_dynamic_table(
+            columns,
+            inventory,
+            styles
+        )
+
+        if table:
+            story.append(table)
+
+    # -----------------------------------------------------
+    # RECOMMENDATIONS
+    # -----------------------------------------------------
+
+    story.append(Paragraph(
+        "MRP Recommendations",
+        styles["MRPSection"]
+    ))
+
+    add_bullets(
         story,
-        onFirstPage=add_footer,
-        onLaterPages=add_footer,
+        report.get("recommendations", []),
+        styles
     )
 
-    print("PDF report created:", pdf_path)
-    return str(pdf_path)
+    # -----------------------------------------------------
+    # DATA LIMITATIONS
+    # -----------------------------------------------------
+
+    limitations = report.get("data_limitations", [])
+
+    if limitations:
+        story.append(Paragraph(
+            "Data Limitations",
+            styles["MRPSection"]
+        ))
+
+        add_bullets(story, limitations, styles)
+
+    doc.build(
+        story,
+        onFirstPage=footer,
+        onLaterPages=footer
+    )
+
+    return pdf_path

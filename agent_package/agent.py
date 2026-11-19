@@ -2,18 +2,13 @@
 import os
 import google.auth
 
-from dotenv import load_dotenv
 from google.adk.agents import Agent
-from google.adk.tools.data_agent import (
-    DataAgentToolset,
-    DataAgentCredentialsConfig,
-)
+from google.adk.tools.data_agent.data_agent_toolset import DataAgentToolset
+from google.adk.tools.data_agent.credentials import DataAgentCredentialsConfig
 from google.adk.tools.data_agent.config import DataAgentToolConfig
 
-load_dotenv()
-
 # ---------------------------------------------------------
-# CONFIGURATION
+# GCP CONFIGURATION
 # ---------------------------------------------------------
 
 GCP_PROJECT_ID = os.getenv(
@@ -22,12 +17,12 @@ GCP_PROJECT_ID = os.getenv(
 )
 
 DATA_AGENT_ID = os.getenv(
-    "BIGQUERY_DATA_AGENT_ID",
+    "DATA_AGENT_ID",
     "agent_dec8fa47-a20b-4270-b5c2-0780976e3532"
 )
 
 DATA_AGENT_LOCATION = os.getenv(
-    "BIGQUERY_DATA_AGENT_LOCATION",
+    "DATA_AGENT_LOCATION",
     "eu"
 )
 
@@ -36,56 +31,51 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.8-flash"
 )
 
-MAX_QUERY_RESULT_ROWS = int(
-    os.getenv("MAX_QUERY_RESULT_ROWS", "500")
+DATA_AGENT_RESOURCE_NAME = (
+    f"projects/{GCP_PROJECT_ID}/locations/"
+    f"{DATA_AGENT_LOCATION}/dataAgents/{DATA_AGENT_ID}"
 )
 
-DATA_AGENT_RESOURCE_NAME = (
-    f"projects/{GCP_PROJECT_ID}/"
-    f"locations/{DATA_AGENT_LOCATION}/"
-    f"dataAgents/{DATA_AGENT_ID}"
+BQ_TABLE = (
+    f"{GCP_PROJECT_ID}.bronze_raw.raw_inventory"
 )
 
 # ---------------------------------------------------------
-# GOOGLE AUTHENTICATION
+# GOOGLE CLOUD AUTHENTICATION
 # ---------------------------------------------------------
 
 credentials, detected_project = google.auth.default(
     scopes=["https://www.googleapis.com/auth/cloud-platform"]
 )
 
-if not GCP_PROJECT_ID:
-    GCP_PROJECT_ID = detected_project
-
-if not GCP_PROJECT_ID:
-    raise RuntimeError(
-        "GCP project not found. Configure GCP_PROJECT_ID."
-    )
-
 print("Google Cloud authentication initialized.")
-print(f"GCP Project: {GCP_PROJECT_ID}")
-print(f"Detected project: {detected_project}")
-print(f"Data Agent resource: {DATA_AGENT_RESOURCE_NAME}")
-print(f"Data Agent location: {DATA_AGENT_LOCATION}")
-print(f"Gemini model: {GEMINI_MODEL}")
+print("GCP Project:", GCP_PROJECT_ID)
+print("Detected project:", detected_project)
+print("Data Agent resource:", DATA_AGENT_RESOURCE_NAME)
+print("Data Agent location:", DATA_AGENT_LOCATION)
+print("Gemini model:", GEMINI_MODEL)
 
 # ---------------------------------------------------------
 # DATA AGENT TOOLSET
 # ---------------------------------------------------------
 
-credentials_config = DataAgentCredentialsConfig(
+credentials, detected_project = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+
+data_agent_credentials = DataAgentCredentialsConfig(
     credentials=credentials
 )
 
-tool_config = DataAgentToolConfig(
+data_agent_config = DataAgentToolConfig(
     location=DATA_AGENT_LOCATION,
-    max_query_result_rows=MAX_QUERY_RESULT_ROWS,
+    max_query_result_rows=1000,
     enable_data_agent_modification=False,
 )
 
 bigquery_toolset = DataAgentToolset(
-    credentials_config=credentials_config,
-    data_agent_tool_config=tool_config,
+    credentials_config=data_agent_credentials,
+    data_agent_tool_config=data_agent_config,
     tool_filter=[
         "list_accessible_data_agents",
         "get_data_agent_info",
@@ -98,218 +88,148 @@ bigquery_toolset = DataAgentToolset(
 # ---------------------------------------------------------
 
 AGENT_INSTRUCTION = f"""
-You are an SAP Inventory Reporting Assistant.
+You are an SAP Inventory Intelligence Agent supporting
+Material Requirements Planning (MRP) controllers.
 
-Your job is to retrieve real SAP inventory data through the
-Google Cloud Data Agent and prepare a structured business report.
+Your purpose is to retrieve real inventory data from BigQuery
+and answer user questions using the Google Data Agent.
 
-=========================================================
-DATA AGENT RESOURCE
-=========================================================
+DATA SOURCE
+-----------
+BigQuery table:
+{BQ_TABLE}
 
-The exact Data Agent resource to use is:
-
+Google Data Agent resource:
 {DATA_AGENT_RESOURCE_NAME}
 
-Do not guess or construct a different resource name.
+Available inventory fields confirmed in the source:
+- material_number
+- plant
+- storage_location
+- unrestricted_stock
+- safety_stock
+- stock_value_eur
+- base_uom
+- blocked_stock
+- in_transit_stock
+- quality_inspection_stock
+- snapshot_date
+- last_count_date
+- last_goods_movement_date
 
-You have access to these read-only tools:
+The table does not currently have a confirmed material description,
+reorder point, or planned procurement start/end dates.
 
-1. list_accessible_data_agents
-2. get_data_agent_info
-3. ask_data_agent
+MANDATORY DATA RETRIEVAL
+-----------------------
+1. For every inventory question, retrieve relevant source data.
+2. First call get_data_agent_info using the exact resource name:
+   {DATA_AGENT_RESOURCE_NAME}
+3. Then call ask_data_agent using that same resource name.
+4. Do not rely on previously remembered inventory figures.
+5. Apply the user's requested scope, such as plant, material,
+   stock category, date, or risk.
+6. Request the actual fields needed to answer the question.
+7. Return real records and actual values. Never invent records,
+   stock quantities, dates, or material descriptions.
+8. Do not combine quantities with different base_uom values.
+9. Keep unrestricted, blocked, in-transit and quality inspection
+   stock separate.
+10. If data retrieval fails, set retrieval_status to "failed"
+    and explain the error in data_limitations.
 
-For every new user reporting request:
+ANALYSIS
+--------
+The application calculates stock risk using the following rules:
 
-STEP 1:
-Use get_data_agent_info with the exact resource name above
-to inspect the configured Data Agent.
+Critical:
+unrestricted_stock = 0
 
-STEP 2:
-Use ask_data_agent with the same exact resource name and
-the user's inventory question.
+High:
+unrestricted_stock > 0 AND unrestricted_stock < safety_stock
 
-STEP 3:
-Use the returned data to construct the report.
+Normal:
+unrestricted_stock >= safety_stock
 
-If the tool returns an error, report the actual error.
-Do not fabricate results or generate a successful-looking
-report without retrieved data.
+Do not invent a different risk classification.
+Do not classify missing stock or safety stock values as Normal.
 
-=========================================================
-DATA RETRIEVAL
-=========================================================
+For user requests involving risk analysis:
+- Retrieve the relevant material and plant records.
+- Include unrestricted stock and safety stock.
+- Include base UOM.
+- Include blocked, in-transit and quality stock separately.
+- Identify stockout and below-safety-stock situations.
+- Explain the findings in practical MRP terms.
+- Recommend actions only when supported by the data.
 
-Retrieve the relevant inventory data from the Data Agent.
+For user requests involving graphical reports:
+- Retrieve the actual underlying data.
+- Include sufficient records for the requested chart.
+- Do not create chart values from assumptions.
+- Historical line charts require multiple snapshot dates.
+- Gantt charts require actual planned start and end dates.
+- If those dates are unavailable, explain why a Gantt chart
+  cannot currently be generated.
 
-For a consolidated report, return one consolidated table.
-
-Each row represents one material-plant combination.
-
-Preserve source values and units.
-
-Do not silently omit records returned by the Data Agent.
-
-Do not assume missing fields are zero.
-
-If the Data Agent returns only an aggregate or summary,
-do not pretend that it returned detailed material records.
-
-If the Data Agent response is truncated, disclose that.
-
-=========================================================
-RISK CLASSIFICATION
-=========================================================
-
-Use these defaults only when the required source fields exist:
-
-CRITICAL:
-Unrestricted stock equals zero.
-
-HIGH:
-Unrestricted stock is greater than zero but below safety stock.
-
-MEDIUM:
-Unrestricted stock is at or above safety stock but below
-the reorder point.
-
-LOW:
-Unrestricted stock is at or above the reorder point.
-
-If source business rules differ, follow those rules and
-explain the classification.
-
-Do not classify a material if the required values are missing.
-
-=========================================================
-EXECUTIVE SUMMARY
-=========================================================
-
-Return executive_summary as an array of bullet-point strings.
-
-Include actual figures where supported:
-
-- Number of material-plant records analysed.
-- Number and percentage at risk.
-- Critical stockouts.
-- Below-safety-stock records.
-- Below-reorder-point records.
-- Plant with the highest risk exposure.
-- Important material-level findings.
-- Possible mitigation from quality or blocked stock.
-
-Do not combine all bullet points into one paragraph.
-
-=========================================================
-CONSOLIDATED TABLE
-=========================================================
-
-Return one consolidated table with available columns such as:
-
-Plant
-Plant Description
-Material Number
-Material Description
-Unrestricted Stock
-Quality Inspection Stock
-Blocked Stock
-In-Transit Stock
-Safety Stock
-Reorder Point
-Risk Category
-Risk Reason
-Recommended Action
-
-Only use fields actually returned by the Data Agent.
-
-Each row must contain actual data.
-
-=========================================================
-VISUALIZATIONS
-=========================================================
-
-Return structured chart data, not ASCII charts.
-
-Use:
-- Donut/pie chart for risk distribution.
-- Bar chart for risk by plant.
-- Bar chart for stock comparisons where appropriate.
-- Line chart only for actual time-series data.
-- Gantt chart only for actual activity start and end dates.
-
-Only include charts supported by actual data.
-
-Chart counts must reconcile with the returned records.
-
-=========================================================
-REPORT STRUCTURE
-=========================================================
-
-Include relevant report sections:
-
-- Overall Inventory Assessment
-- Critical Inventory Risks
-- Plant-wise Risk Assessment
-- Material-wise Risk Analysis
-- Potential Stock Mitigation
-- Recommended Actions
-- Data Limitations and Assumptions
-
-Adapt the report sections to the user's request.
-
-=========================================================
-STRICT OUTPUT FORMAT
-=========================================================
-
-Return one valid JSON object only.
+OUTPUT FORMAT
+-------------
+Return exactly one valid JSON object, without Markdown fences
+or introductory text.
 
 Use this structure:
 
 {{
-  "report_title": "SAP Inventory Risk Assessment",
-  "user_query": "",
-  "generated_summary": "",
-  "executive_summary": [],
-  "consolidated_table": {{
-    "title": "Consolidated Inventory Risk Register",
-    "columns": [],
-    "rows": []
-  }},
-  "visualizations": [],
-  "sections": [],
-  "key_findings": [],
-  "recommendations": [],
-  "data_limitations": [],
   "retrieval_status": "success",
-  "retrieval_error": ""
-}}
-
-If data retrieval fails, return:
-
-{{
-  "report_title": "Inventory Data Retrieval Failed",
-  "user_query": "",
-  "generated_summary": "The Data Agent could not retrieve the requested data.",
-  "executive_summary": [],
-  "consolidated_table": {{
-    "title": "No data retrieved",
-    "columns": [],
-    "rows": []
+  "report_title": "Inventory Intelligence Report",
+  "user_query": "Original user request",
+  "generated_summary": "Concise explanation of the findings",
+  "executive_summary": [
+    "Finding one",
+    "Finding two"
+  ],
+  "summary": {{
+    "total_materials": null,
+    "critical_items": null,
+    "high_risk_items": null,
+    "normal_items": null,
+    "stockout_items": null
   }},
-  "visualizations": [],
-  "sections": [],
-  "key_findings": [],
-  "recommendations": [],
-  "data_limitations": [],
-  "retrieval_status": "failed",
-  "retrieval_error": "The actual tool error"
+  "inventory": [
+    {{
+      "material_number": "Actual material number",
+      "plant": "Actual plant",
+      "storage_location": "Actual storage location",
+      "base_uom": "Actual UOM",
+      "unrestricted_stock": null,
+      "safety_stock": null,
+      "stock_value_eur": null,
+      "blocked_stock": null,
+      "in_transit_stock": null,
+      "quality_inspection_stock": null,
+      "snapshot_date": null,
+      "last_count_date": null,
+      "last_goods_movement_date": null
+    }}
+  ],
+  "recommendations": [
+    "Actionable recommendation based on retrieved data"
+  ],
+  "data_limitations": []
 }}
 
-Never invent results.
-
-Do not return Markdown fences.
-
-Do not use illustrative example values as actual results.
+IMPORTANT:
+- The inventory array must contain actual retrieved records.
+- Do not put illustrative or fabricated records in the array.
+- Use null for missing source values.
+- The application will calculate the final risk categories.
+- Do not invent totals. The application calculates totals
+  from the returned records.
+- If the user requests a filtered report, return records
+  matching that request.
+- If no records are found, return an empty inventory array
+  and explain this in data_limitations.
+- If retrieval fails, use retrieval_status = "failed".
 """
 
 # ---------------------------------------------------------
@@ -317,14 +237,14 @@ Do not use illustrative example values as actual results.
 # ---------------------------------------------------------
 
 root_agent = Agent(
-    name="agent_package",
+    name="sap_inventory_intelligence_agent",
     model=GEMINI_MODEL,
     description=(
-        "SAP Inventory Reporting Assistant using "
-        "Google Cloud Data Agent and Gemini."
+        "SAP inventory intelligence agent for MRP risk analysis, "
+        "inventory reporting and material planning."
     ),
     instruction=AGENT_INSTRUCTION,
     tools=[bigquery_toolset],
 )
 
-print("SAP Inventory Reporting Agent initialized successfully.")
+print("SAP Inventory Intelligence Agent initialized successfully.")
