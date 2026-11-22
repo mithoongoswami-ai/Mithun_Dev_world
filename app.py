@@ -1,623 +1,68 @@
-
 import os
-import re
-import json
-import asyncio
 import html
-from datetime import datetime
 
 import gradio as gr
-from dotenv import load_dotenv
 
-from google.adk.apps import App
-from google.adk.runners import InMemoryRunner
-from google.genai import types
+import report_store as store
+import scheduler_service as sched
 
-from agent_package.agent import root_agent
-
-from report_renderer import render_report_html
-from report_generator import generate_pdf_report
-
-from gmail_service import send_report_email
-
-
-load_dotenv()
-
-APP_NAME = "sap_inventory_intelligence"
-USER_ID = "mrp_controller"
-
-
-# =========================================================
-# ADK RUNNER
-# =========================================================
-
-adk_app = App(
-    name=APP_NAME,
-    root_agent=root_agent
+from report_service import (
+    run_report_job,
+    render_html_safe,
+    REPORT_FORMATS,
 )
-
-runner = InMemoryRunner(app=adk_app)
-
-
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
-
-def safe_number(value):
-    if value is None or value == "":
-        return None
-
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return None
+from gmail_service import send_report_email, parse_recipients
 
 
-def display_number(value):
-    if value is None:
-        return "N/A"
+DEFAULT_SUBJECT = "SAP Inventory Intelligence Report"
+DEFAULT_TZ = "Europe/Berlin" if "Europe/Berlin" in sched.TIMEZONES else "UTC"
 
-    if float(value).is_integer():
-        return str(int(value))
+store.init_db()
 
-    return f"{value:,.2f}"
-
-
-def extract_json(text):
-    """
-    Extract a JSON object from the agent response.
-    """
-
-    text = text.strip()
-
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(r"\s*```$", "", text)
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
-        raise ValueError(
-            "The agent did not return a valid JSON object."
-        )
-
-    return json.loads(text[start:end + 1])
+EMPTY_REPORT_HTML = """
+<div class="empty-state">
+  <div class="empty-icon">&#128202;</div>
+  <div class="empty-title">No report yet</div>
+  <div class="empty-text">
+    Enter an inventory question on the left and click
+    <b>Generate report</b>. Your dashboard, charts and
+    inventory table will appear here.
+  </div>
+</div>
+"""
 
 
 # =========================================================
-# RUN ADK AGENT
+# TAB 1  -  ON-DEMAND REPORTS
 # =========================================================
 
-async def run_agent_async(question):
-    session = await runner.session_service.create_session(
-        app_name=APP_NAME,
-        user_id=USER_ID
-    )
-
-    message = types.Content(
-        role="user",
-        parts=[types.Part(text=question)]
-    )
-
-    final_text = []
-
-    async for event in runner.run_async(
-        user_id=USER_ID,
-        session_id=session.id,
-        new_message=message
-    ):
-
-        if getattr(event, "error_code", None):
-            raise RuntimeError(
-                getattr(event, "error_message", "ADK agent execution failed")
-            )
-
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if getattr(part, "text", None):
-                        final_text.append(part.text)
-
-    if not final_text:
-        raise RuntimeError(
-            "The ADK agent did not return a final response."
-        )
-
-    return "\n".join(final_text)
-
-
-def run_inventory_agent(question):
-    return asyncio.run(run_agent_async(question))
-
-
-# =========================================================
-# NORMALIZE INVENTORY
-# =========================================================
-
-def normalize_inventory(report):
-    inventory = report.get("inventory", [])
-
-    if not isinstance(inventory, list):
-        raise ValueError("The inventory field must be a list.")
-
-    normalized = []
-
-    for row in inventory:
-        if not isinstance(row, dict):
-            continue
-
-        item = {
-            "material_number": row.get("material_number"),
-            "plant": row.get("plant"),
-            "storage_location": row.get("storage_location"),
-            "base_uom": row.get("base_uom"),
-
-            "unrestricted_stock": safe_number(
-                row.get("unrestricted_stock")
-            ),
-
-            "safety_stock": safe_number(
-                row.get("safety_stock")
-            ),
-
-            "stock_value_eur": safe_number(
-                row.get("stock_value_eur")
-            ),
-
-            "blocked_stock": safe_number(
-                row.get("blocked_stock")
-            ),
-
-            "in_transit_stock": safe_number(
-                row.get("in_transit_stock")
-            ),
-
-            "quality_inspection_stock": safe_number(
-                row.get("quality_inspection_stock")
-            ),
-
-            "snapshot_date": row.get("snapshot_date"),
-            "last_count_date": row.get("last_count_date"),
-            "last_goods_movement_date": row.get(
-                "last_goods_movement_date"
-            ),
-        }
-
-        stock = item["unrestricted_stock"]
-        safety = item["safety_stock"]
-
-        if stock is None or safety is None:
-            item["risk"] = "Unknown"
-        elif stock == 0:
-            item["risk"] = "Critical"
-        elif stock < safety:
-            item["risk"] = "High"
-        else:
-            item["risk"] = "Normal"
-
-        normalized.append(item)
-
-    return normalized
-
-
-# =========================================================
-# CALCULATE REPORT KPIs
-# =========================================================
-
-def calculate_summary(inventory):
-    # A material is counted once per plant and UOM.
-    # Storage-location rows for the same material are not
-    # treated as separate materials in the KPI count.
-
-    material_keys = set()
-
-    for row in inventory:
-        material_keys.add((
-            row.get("material_number"),
-            row.get("plant"),
-            row.get("base_uom"),
-            row.get("snapshot_date"),
-        ))
-
-    critical = sum(
-        1 for row in inventory
-        if row["risk"] == "Critical"
-    )
-
-    high = sum(
-        1 for row in inventory
-        if row["risk"] == "High"
-    )
-
-    normal = sum(
-        1 for row in inventory
-        if row["risk"] == "Normal"
-    )
-
-    stockout = sum(
-        1 for row in inventory
-        if row["unrestricted_stock"] == 0
-    )
-
-    return {
-        "total_materials": len(material_keys),
-        "critical_items": critical,
-        "high_risk_items": high,
-        "normal_items": normal,
-        "stockout_items": stockout,
-    }
-
-
-# =========================================================
-# BUILD VISUALIZATIONS
-# =========================================================
-
-def wants_chart(question, chart_type):
-    question = question.lower()
-
-    keywords = {
-        "pie": ["pie", "donut", "doughnut"],
-        "bar": ["bar", "column", "compare", "comparison"],
-        "line": ["line", "trend", "history", "historical"],
-        "gantt": ["gantt", "timeline", "procurement schedule"],
-    }
-
-    return any(
-        word in question
-        for word in keywords.get(chart_type, [])
-    )
-
-
-def build_visualizations(inventory, question):
-    charts = []
-
-    if not inventory:
-        return charts
-
-    # -----------------------------------------------------
-    # PIE: RISK DISTRIBUTION
-    # -----------------------------------------------------
-
-    risk_counts = {
-        "Critical": 0,
-        "High": 0,
-        "Normal": 0,
-        "Unknown": 0,
-    }
-
-    for row in inventory:
-        risk_counts[row["risk"]] += 1
-
-    risk_labels = [
-        key for key, value in risk_counts.items()
-        if value > 0
-    ]
-
-    risk_values = [
-        risk_counts[key] for key in risk_labels
-    ]
-
-    if risk_values and (
-        wants_chart(question, "pie")
-        or wants_chart(question, "gantt") is False
-    ):
-        charts.append({
-            "type": "donut",
-            "title": "Inventory Risk Distribution",
-            "labels": risk_labels,
-            "values": risk_values,
-        })
-
-    # -----------------------------------------------------
-    # BAR: STOCK BY PLANT AND UOM
-    # -----------------------------------------------------
-
-    # Never combine different units of measure.
-    uoms = sorted(set(
-        str(row.get("base_uom"))
-        for row in inventory
-        if row.get("base_uom")
-    ))
-
-    plants = sorted(set(
-        str(row.get("plant"))
-        for row in inventory
-        if row.get("plant")
-    ))
-
-    if plants:
-        for uom in uoms:
-            plant_totals = {}
-
-            for row in inventory:
-                if str(row.get("base_uom")) != uom:
-                    continue
-
-                stock = row.get("unrestricted_stock")
-
-                if stock is None:
-                    continue
-
-                plant = str(row.get("plant") or "Unknown")
-
-                plant_totals[plant] = (
-                    plant_totals.get(plant, 0) + stock
-                )
-
-            if plant_totals:
-                charts.append({
-                    "type": "bar",
-                    "title": (
-                        f"Unrestricted Stock by Plant ({uom})"
-                    ),
-                    "labels": list(plant_totals.keys()),
-                    "values": list(plant_totals.values()),
-                    "y_label": f"Quantity ({uom})",
-                })
-
-    # -----------------------------------------------------
-    # BAR: TOP MATERIALS BY STOCK
-    # -----------------------------------------------------
-
-    # Use the most common UOM for a comparable material chart.
-    if uoms:
-        main_uom = max(
-            uoms,
-            key=lambda u: sum(
-                1 for row in inventory
-                if str(row.get("base_uom")) == u
-            )
-        )
-
-        material_totals = {}
-
-        for row in inventory:
-            if str(row.get("base_uom")) != main_uom:
-                continue
-
-            stock = row.get("unrestricted_stock")
-
-            if stock is None:
-                continue
-
-            material = str(row.get("material_number") or "Unknown")
-
-            material_totals[material] = (
-                material_totals.get(material, 0) + stock
-            )
-
-        top_materials = sorted(
-            material_totals.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:15]
-
-        if top_materials:
-            charts.append({
-                "type": "bar",
-                "title": (
-                    f"Top Materials by Unrestricted Stock ({main_uom})"
-                ),
-                "labels": [item[0] for item in top_materials],
-                "values": [item[1] for item in top_materials],
-                "y_label": f"Quantity ({main_uom})",
-            })
-
-    # -----------------------------------------------------
-    # LINE: HISTORICAL INVENTORY TREND
-    # -----------------------------------------------------
-
-    snapshots = {}
-
-    for row in inventory:
-        date = row.get("snapshot_date")
-        uom = row.get("base_uom")
-        stock = row.get("unrestricted_stock")
-
-        if not date or not uom or stock is None:
-            continue
-
-        try:
-            date_key = str(date)[:10]
-        except Exception:
-            continue
-
-        snapshots.setdefault(uom, {})
-        snapshots[uom][date_key] = (
-            snapshots[uom].get(date_key, 0) + stock
-        )
-
-    for uom, values in snapshots.items():
-        dates = sorted(values.keys())
-
-        if len(dates) < 2:
-            continue
-
-        charts.append({
-            "type": "line",
-            "title": f"Inventory Trend ({uom})",
-            "x_label": "Snapshot date",
-            "y_label": f"Unrestricted stock ({uom})",
-            "series": [{
-                "name": f"Unrestricted stock ({uom})",
-                "labels": dates,
-                "values": [values[d] for d in dates],
-            }]
-        })
-
-    # -----------------------------------------------------
-    # GANTT: ONLY WHEN REAL PLANNED DATES EXIST
-    # -----------------------------------------------------
-
-    gantt_tasks = []
-
-    for row in inventory:
-        start = row.get("planned_start_date")
-        end = row.get("planned_end_date")
-
-        if start and end:
-            gantt_tasks.append({
-                "task": str(row.get("material_number", "Material")),
-                "start": start,
-                "end": end,
-            })
-
-    if gantt_tasks:
-        charts.append({
-            "type": "gantt",
-            "title": "Material Procurement Timeline",
-            "tasks": gantt_tasks,
-        })
-
-    return charts
-
-
-# =========================================================
-# BUILD MRP RECOMMENDATIONS
-# =========================================================
-
-def build_recommendations(inventory):
-    recommendations = []
-
-    critical = [
-        row for row in inventory
-        if row["risk"] == "Critical"
-    ]
-
-    high = [
-        row for row in inventory
-        if row["risk"] == "High"
-    ]
-
-    if critical:
-        recommendations.append(
-            f"{len(critical)} inventory record(s) have zero "
-            "unrestricted stock. Review open requirements and "
-            "urgent replenishment or transfer options."
-        )
-
-    if high:
-        recommendations.append(
-            f"{len(high)} inventory record(s) are below safety "
-            "stock. Review planned orders, open purchase orders "
-            "and upcoming demand."
-        )
-
-    if not critical and not high:
-        recommendations.append(
-            "No Critical or High risk records were identified "
-            "using the available unrestricted-stock and "
-            "safety-stock values."
-        )
-
-    missing = sum(
-        1 for row in inventory
-        if row["unrestricted_stock"] is None
-        or row["safety_stock"] is None
-    )
-
-    if missing:
-        recommendations.append(
-            f"{missing} record(s) have missing stock or safety "
-            "stock values and could not be classified."
-        )
-
-    return recommendations
-
-
-# =========================================================
-# GENERATE REPORT
-# =========================================================
-
-def generate_report(question):
+def generate_report(question, report_format, include_vendor_check=False):
     if not question or not question.strip():
         return (
             "<p>Please enter an inventory question.</p>",
-            None,
-            None,
-            None,
+            None, None, None,
             "Please enter a question."
         )
 
     try:
-        raw_response = run_inventory_agent(question)
-
-        report = extract_json(raw_response)
-
-        if report.get("retrieval_status") == "failed":
-            raise RuntimeError(
-                "Data retrieval failed: " +
-                "; ".join(report.get("data_limitations", []))
-            )
-
-        inventory = normalize_inventory(report)
-
-        if not inventory:
-            raise RuntimeError(
-                "The Data Agent returned no inventory records. "
-                "Please check the requested material, plant or "
-                "inventory scope and try again."
-            )
-
-        report["inventory"] = inventory
-        report["summary"] = calculate_summary(inventory)
-
-        report["visualizations"] = build_visualizations(
-            inventory,
-            question
-        )
-
-        report["recommendations"] = (
-            report.get("recommendations", [])
-            + build_recommendations(inventory)
-        )
-
-        report["user_query"] = question
-        report["generated_at"] = datetime.now().strftime(
-            "%d %B %Y, %H:%M"
-        )
-
-        if not report.get("report_title"):
-            report["report_title"] = "SAP Inventory Intelligence Report"
-
-        if not report.get("executive_summary"):
-            report["executive_summary"] = [
-                (
-                    f"{report['summary']['total_materials']} "
-                    "material/plant/UOM/snapshot combinations "
-                    "were returned."
-                ),
-                (
-                    f"{report['summary']['critical_items']} "
-                    "records are Critical."
-                ),
-                (
-                    f"{report['summary']['high_risk_items']} "
-                    "records are High risk."
-                ),
-            ]
-
-        report_html = render_report_html(report)
-
-        pdf_path = generate_pdf_report(report)
-
-        status = (
-            f"Report generated successfully. "
-            f"{len(inventory)} inventory records processed."
+        result = run_report_job(
+            question=question.strip(),
+            report_format=report_format,
+            report_type="On-demand",
+            include_vendor_check=bool(include_vendor_check),
         )
 
         return (
-            report_html,
-            pdf_path,
-            pdf_path,
-            report,
-            status
+            render_html_safe(result["report"]),
+            result["file_path"],          # gr.File download
+            result["file_path"],          # file_state (for e-mail)
+            result["report_id"],          # id_state
+            (
+                f"Report **{result['report_id']}** generated. "
+                f"{len(result['report']['inventory'])} inventory "
+                "records processed. It is also listed under "
+                "*Generated Reports*."
+            ),
         )
 
     except Exception as exc:
@@ -629,46 +74,41 @@ def generate_report(question):
         </div>
         """
 
-        return (
-            error_html,
-            None,
-            None,
-            None,
-            f"Error: {exc}"
-        )
+        return error_html, None, None, None, f"Error: {exc}"
 
 
-# =========================================================
-# GMAIL INTEGRATION
-# =========================================================
-
-def send_email(recipient, subject, body, pdf_path):
-    if not recipient or not recipient.strip():
-        return "Please enter a recipient email address."
-
-    if not pdf_path or not os.path.exists(pdf_path):
+def send_email(recipients, subject, body, file_path, report_id):
+    if not file_path or not os.path.exists(file_path):
         return "Please generate a report before sending the email."
 
-    if not subject or not subject.strip():
-        subject = "SAP Inventory Intelligence Report"
-
     try:
-        result = send_report_email(
-            recipient=recipient.strip(),
-            subject=subject,
+        recipient_list = parse_recipients(recipients)
+
+        send_report_email(
+            recipient=recipient_list,
+            subject=(subject or "").strip() or DEFAULT_SUBJECT,
             body=body or "Please find the SAP inventory report attached.",
-            attachment_path=pdf_path
+            attachment_path=file_path,
+            interactive=True,
         )
 
-        return str(result)
+        if report_id:
+            store.update_report(
+                report_id,
+                email_status=f"Sent to {len(recipient_list)} recipient(s)"
+            )
+
+        return f"Email sent to {', '.join(recipient_list)}."
 
     except Exception as exc:
+        if report_id:
+            store.update_report(
+                report_id,
+                email_status=f"Failed: {exc}"[:300]
+            )
+
         return f"Email sending failed: {exc}"
 
-
-# =========================================================
-# CLEAR
-# =========================================================
 
 def clear_report():
     return (
@@ -676,144 +116,806 @@ def clear_report():
         None,
         None,
         None,
-        "<p>Your generated report will appear here.</p>",
+        EMPTY_REPORT_HTML,
         "Ready to generate a report."
     )
 
 
 # =========================================================
-# GRADIO UI
+# TAB 2  -  SCHEDULES
 # =========================================================
 
-with gr.Blocks(
-    title="SAP Inventory Intelligence",
-    theme=gr.themes.Soft()
-) as demo:
+SCHEDULE_HEADERS = [
+    "Schedule ID", "Name", "Recurrence", "Times", "Timezone",
+    "Recipients", "Format", "Status", "Next run", "Last run",
+    "Last result",
+]
 
-    gr.Markdown("""
-    # SAP Inventory Intelligence
-    ### AI-powered inventory analysis for MRP controllers
 
-    Ask questions about material availability, stock risk,
-    plant inventory, material shortages and replenishment.
-    """)
+def schedules_table():
+    rows = []
 
-    report_state = gr.State(None)
-    pdf_state = gr.State(None)
+    for s in store.list_schedules():
+        active = s["status"] == "active"
 
-    with gr.Row():
-        question_input = gr.Textbox(
-            label="Ask your inventory question",
-            placeholder=(
-                "Example: Analyse material stock risk across "
-                "all plants and show a donut chart and a bar chart."
-            ),
-            lines=3,
-            scale=5
+        rows.append([
+            s["schedule_id"],
+            s["name"],
+            s["recurrence"],
+            sched.describe_slots(s["recurrence"], s["slots"]),
+            s["timezone"],
+            ", ".join(s["recipients"]),
+            s["report_format"],
+            "Active" if active else "Cancelled",
+            sched.next_run_text(s["schedule_id"]) if active else "",
+            store.fmt_ts(s["last_run_at"], s["timezone"]),
+            s["last_status"] or "",
+        ])
+
+    return rows
+
+
+def blank_form():
+    """Values for form_outputs (see below) = a new, empty schedule."""
+    return [
+        "",                              # editing_id
+        "",                              # name
+        "",                              # question
+        "",                              # recipients
+        DEFAULT_SUBJECT,                 # subject
+        sched.DEFAULT_EMAIL_BODY,        # e-mail body
+        DEFAULT_TZ,                      # timezone
+        "PDF",                           # report format
+        "Everyday",                      # recurrence
+        "08:00",                         # time (non-custom)
+        *[False] * 7,                    # custom: day enabled
+        *["08:00"] * 7,                  # custom: day time
+        False,                           # include vendor e-mail check
+    ]
+
+
+def new_schedule():
+    return [*blank_form(), "Creating a new schedule."]
+
+
+def save_schedule(
+    editing_id, name, question, recipients, subject, body,
+    tz, report_format, recurrence, simple_time, *day_values
+):
+    try:
+        day_enabled = day_values[:7]
+        day_times = day_values[7:14]
+        include_vendor = bool(day_values[14]) if len(day_values) > 14 else False
+
+        name = (name or "").strip() or "Scheduled inventory report"
+
+        if not question or not question.strip():
+            raise ValueError("Enter the inventory question to run.")
+
+        recipient_list = parse_recipients(recipients)
+
+        if tz not in sched.TIMEZONES:
+            raise ValueError(f"Unknown time zone: {tz}")
+
+        slots = sched.build_slots(
+            recurrence, simple_time, day_enabled, day_times
         )
 
-    with gr.Row():
-        generate_button = gr.Button(
-            "Generate Inventory Report",
-            variant="primary"
+        values = dict(
+            name=name,
+            question=question.strip(),
+            recipients=recipient_list,
+            subject=(subject or "").strip() or DEFAULT_SUBJECT,
+            email_body=body or sched.DEFAULT_EMAIL_BODY,
+            timezone=tz,
+            report_format=report_format,
+            recurrence=recurrence,
+            slots=slots,
+            include_vendor_check=include_vendor,
         )
 
-        clear_button = gr.Button("Clear")
+        if editing_id:
+            store.update_schedule(editing_id, status="active", **values)
+            schedule_id = editing_id
+            verb = "updated"
 
-    report_status = gr.Markdown("Ready to generate a report.")
+        else:
+            schedule_id = store.create_schedule(
+                name=values["name"],
+                question=values["question"],
+                recipients=values["recipients"],
+                subject=values["subject"],
+                email_body=values["email_body"],
+                tz=values["timezone"],
+                report_format=values["report_format"],
+                recurrence=values["recurrence"],
+                slots=values["slots"],
+                include_vendor_check=values["include_vendor_check"],
+            )
+            verb = "created"
 
-    gr.Markdown("---")
-    gr.Markdown("## Inventory Intelligence Dashboard")
+        sched.register_schedule(store.get_schedule(schedule_id))
 
-    report_output = gr.HTML(
-        value="<p>Your generated report will appear here.</p>"
+        message = (
+            f"Schedule **{schedule_id}** {verb}. "
+            f"Next run: {sched.next_run_text(schedule_id)} ({tz})."
+        )
+
+        return schedule_id, message, schedules_table()
+
+    except Exception as exc:
+        return editing_id, f"Could not save schedule: {exc}", schedules_table()
+
+
+def load_schedule(df, evt: gr.SelectData):
+    """Row clicked in the schedules table -> load it into the form."""
+    schedule_id = df.iloc[evt.index[0]]["Schedule ID"]
+    s = store.get_schedule(schedule_id)
+
+    if not s:
+        return [*blank_form(), "Schedule not found."]
+
+    slot_by_day = {slot["day"]: slot["time"] for slot in s["slots"]}
+    first_time = s["slots"][0]["time"] if s["slots"] else "08:00"
+
+    values = [
+        s["schedule_id"],
+        s["name"],
+        s["question"],
+        ", ".join(s["recipients"]),
+        s["subject"],
+        s["email_body"],
+        s["timezone"],
+        s["report_format"],
+        s["recurrence"],
+        first_time,
+        *[day in slot_by_day for day in sched.DAYS],
+        *[slot_by_day.get(day, "08:00") for day in sched.DAYS],
+        bool(s.get("include_vendor_check")),
+    ]
+
+    note = f"Editing **{schedule_id}**."
+
+    if s["status"] != "active":
+        note += " (cancelled - saving will re-activate it)"
+
+    return [*values, note]
+
+
+def cancel_schedule(editing_id):
+    if not editing_id:
+        return "Select a schedule in the table first.", schedules_table()
+
+    store.update_schedule(editing_id, status="cancelled")
+    sched.unregister_schedule(editing_id)
+
+    return (
+        f"Schedule **{editing_id}** cancelled. "
+        "Its previously generated reports are kept.",
+        schedules_table(),
     )
 
-    with gr.Row():
-        pdf_output = gr.File(
-            label="Download PDF Report"
-        )
 
-    gr.Markdown("---")
-    gr.Markdown("## Email Report Using Gmail")
+def run_selected_now(editing_id):
+    if not editing_id:
+        return "Select a schedule in the table first."
 
-    with gr.Row():
-        recipient_input = gr.Textbox(
-            label="Recipient email",
-            placeholder="recipient@example.com"
-        )
+    sched.run_now_in_background(editing_id)
 
-        subject_input = gr.Textbox(
-            label="Email subject",
-            value="SAP Inventory Intelligence Report"
-        )
-
-    email_body_input = gr.Textbox(
-        label="Email message",
-        value=(
-            "Hello,\n\n"
-            "Please find attached the SAP Inventory Intelligence "
-            "report generated from the latest inventory data.\n\n"
-            "Regards"
-        ),
-        lines=4
+    return (
+        f"Schedule **{editing_id}** started. Follow its progress in "
+        "*Generated Reports* (use Refresh)."
     )
 
-    send_email_button = gr.Button(
-        "Send Report via Gmail",
-        variant="primary"
+
+def toggle_recurrence(recurrence):
+    custom = recurrence == "Custom"
+
+    return (
+        gr.update(visible=not custom),
+        gr.update(visible=custom),
     )
 
-    email_status = gr.Markdown()
 
-    # -----------------------------------------------------
-    # GENERATE REPORT
-    # -----------------------------------------------------
+# =========================================================
+# TAB 3  -  GENERATED REPORTS
+# =========================================================
+
+REPORT_HEADERS = [
+    "Report ID", "Report name", "Generated", "Type", "Format",
+    "Status", "Email", "Records",
+]
+
+
+def reports_table(search, report_type, status):
+    rows = []
+
+    for r in store.list_reports(search, report_type, status):
+        rows.append([
+            r["report_id"],
+            r["name"],
+            store.fmt_ts(r["created_at"]),
+            r["report_type"],
+            r["report_format"],
+            r["status"],
+            r["email_status"] or "",
+            r["record_count"] if r["record_count"] is not None else "",
+        ])
+
+    return rows
+
+
+def select_report(df, evt: gr.SelectData):
+    report_id = df.iloc[evt.index[0]]["Report ID"]
+    r = store.get_report(report_id)
+
+    if not r:
+        return None, "Report not found."
+
+    details = [
+        f"**{r['report_id']}** - {r['name']}",
+        f"- Type: {r['report_type']}  |  Format: {r['report_format']}",
+        f"- Status: {r['status']}  |  Email: {r['email_status']}",
+        f"- Request: {r['user_query']}",
+    ]
+
+    if r["error"]:
+        details.append(f"- Error: {r['error']}")
+
+    path = r["file_path"]
+
+    if path and os.path.exists(path):
+        return path, "\n".join(details)
+
+    details.append("- No downloadable file is available for this report.")
+    return None, "\n".join(details)
+
+
+# =========================================================
+# GRADIO UI  -  layout, colours and orientation only
+# =========================================================
+
+import inspect
+
+CSS = """
+:root{
+  --navy:#0B2545; --navy-2:#13315C; --blue:#1D5FD1; --blue-soft:#EAF1FF;
+  --ink:#0F172A; --muted:#64748B; --line:#E2E8F0; --bg:#F1F4F9;
+  --ok:#0F766E; --danger:#B42318;
+}
+body, .gradio-container{ background:var(--bg) !important; }
+.gradio-container{
+  max-width:1560px !important; margin:0 auto !important;
+  padding:18px 24px 40px !important;
+  font-family:"Inter","Segoe UI",system-ui,-apple-system,sans-serif !important;
+  color:var(--ink);
+}
+footer{ display:none !important; }
+
+/* ---------- header banner ---------- */
+.app-header{
+  display:flex; justify-content:space-between; align-items:center; gap:20px;
+  padding:22px 30px; margin-bottom:16px; border-radius:16px; color:#fff;
+  background:linear-gradient(115deg,#0B2545 0%,#13315C 55%,#1D5FD1 135%);
+  box-shadow:0 8px 24px rgba(11,37,69,.22);
+}
+.app-header h1{ margin:0; font-size:24px; font-weight:700; letter-spacing:.2px; color:#fff; }
+.app-header p{ margin:4px 0 0; font-size:13.5px; color:#C7D6F0; }
+.app-header .chips{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.app-header .chip{
+  padding:5px 12px; border-radius:999px; font-size:11.5px; font-weight:600;
+  background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.22); color:#E6EEFB;
+}
+
+/* ---------- tabs ---------- */
+div[role="tablist"], .tab-nav{ border-bottom:1px solid var(--line) !important; margin-bottom:6px; }
+button[role="tab"]{
+  font-size:14px !important; font-weight:600 !important; color:var(--muted) !important;
+  padding:12px 22px !important; border:none !important; background:transparent !important;
+  border-bottom:3px solid transparent !important; border-radius:0 !important;
+}
+button[role="tab"]:hover{ color:var(--navy) !important; }
+button[role="tab"][aria-selected="true"], button[role="tab"].selected{
+  color:var(--blue) !important; border-bottom:3px solid var(--blue) !important;
+}
+
+/* ---------- cards ---------- */
+.card{
+  background:#fff !important; border:1px solid var(--line) !important;
+  border-radius:14px !important; padding:20px 22px !important;
+  box-shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.05) !important;
+  gap:12px !important;
+}
+.sec-title{
+  display:flex; align-items:center; gap:10px; margin:0 0 2px;
+  font-size:15px; font-weight:700; color:var(--navy);
+}
+.sec-title::before{
+  content:""; width:4px; height:18px; border-radius:2px; background:var(--blue);
+}
+.sec-sub{ margin:-4px 0 4px; font-size:12.5px; color:var(--muted); }
+
+/* ---------- inputs ---------- */
+.card label span, .card .block-title, .card [data-testid="block-info"]{
+  font-size:12px !important; font-weight:600 !important; color:#334155 !important;
+  letter-spacing:.2px;
+}
+.card textarea, .card input[type="text"], .card input[type="number"], .card .wrap-inner{
+  border-radius:10px !important; border-color:var(--line) !important; background:#F8FAFC !important;
+}
+.card textarea:focus, .card input[type="text"]:focus{
+  border-color:var(--blue) !important; background:#fff !important;
+  box-shadow:0 0 0 3px rgba(29,95,209,.14) !important;
+}
+
+/* ---------- buttons ---------- */
+button.primary{
+  background:linear-gradient(180deg,#2468DB,#1D5FD1) !important; border:none !important;
+  color:#fff !important; font-weight:600 !important; border-radius:10px !important;
+  box-shadow:0 2px 8px rgba(29,95,209,.30) !important;
+}
+button.primary:hover{ filter:brightness(1.08); }
+button.secondary{
+  background:#fff !important; color:var(--navy) !important; font-weight:600 !important;
+  border:1px solid #CBD5E1 !important; border-radius:10px !important;
+}
+button.secondary:hover{ background:var(--blue-soft) !important; border-color:var(--blue) !important; }
+button.stop{
+  background:#fff !important; color:var(--danger) !important; font-weight:600 !important;
+  border:1px solid #F2B8B5 !important; border-radius:10px !important;
+}
+button.stop:hover{ background:#FEF3F2 !important; }
+
+/* ---------- status line ---------- */
+.status-line{
+  padding:9px 14px !important; border-radius:10px !important;
+  background:var(--blue-soft) !important; border:1px solid #D4E2FB !important;
+  color:var(--navy) !important; font-size:13px !important; min-height:20px;
+}
+.status-line p{ margin:0 !important; }
+
+/* ---------- tables ---------- */
+.table-wrap, .dataframe-wrap{ border-radius:12px !important; border:1px solid var(--line) !important; overflow:hidden; }
+.table-wrap thead th, table thead th{
+  background:var(--navy) !important; color:#fff !important; font-size:12px !important;
+  font-weight:600 !important; letter-spacing:.3px;
+}
+.table-wrap thead th *, table thead th *{ color:#fff !important; }
+.table-wrap tbody tr:nth-child(even) td{ background:#F8FAFC !important; }
+.table-wrap tbody tr:hover td{ background:var(--blue-soft) !important; }
+.table-wrap td{ font-size:12.5px !important; }
+
+/* ---------- report area ---------- */
+.report-pane{
+  background:#fff; border-radius:12px; padding:6px;
+  max-height:1100px; overflow:auto;
+}
+.empty-state{ text-align:center; padding:90px 30px; color:var(--muted); }
+.empty-icon{ font-size:44px; margin-bottom:10px; }
+.empty-title{ font-size:18px; font-weight:700; color:var(--navy); margin-bottom:6px; }
+.empty-text{ font-size:13.5px; max-width:420px; margin:0 auto; line-height:1.55; }
+
+/* ---------- custom schedule rows ---------- */
+.day-row{ align-items:center !important; gap:8px !important; }
+.day-row input[type="text"]{ text-align:center; }
+
+.detail-box{ font-size:13px; line-height:1.7; color:#334155; }
+"""
+
+HEADER_HTML = """
+<div class="app-header">
+  <div>
+    <h1>SAP Inventory Intelligence</h1>
+    <p>AI-powered inventory analysis and automated reporting for MRP controllers</p>
+  </div>
+  <div class="chips">
+    <span class="chip">BigQuery</span>
+    <span class="chip">Gemini Data Agent</span>
+    <span class="chip">MRP Risk Analysis</span>
+  </div>
+</div>
+"""
+
+
+def section(title, subtitle=None):
+    """Card heading used inside every panel."""
+    gr.HTML(
+        f'<div class="sec-title">{title}</div>'
+        + (f'<div class="sec-sub">{subtitle}</div>' if subtitle else "")
+    )
+
+
+THEME = gr.themes.Base(
+    primary_hue="blue",
+    secondary_hue="indigo",
+    neutral_hue="slate",
+    radius_size="lg",
+    font=[
+        gr.themes.GoogleFont("Inter"),
+        "Segoe UI", "system-ui", "sans-serif",
+    ],
+)
+
+# Gradio 6 moved theme/css from Blocks() to launch(); support both.
+_STYLE_IN_LAUNCH = "css" in inspect.signature(gr.Blocks.launch).parameters
+
+_blocks_kwargs = {} if _STYLE_IN_LAUNCH else {"theme": THEME, "css": CSS}
+_launch_kwargs = {"theme": THEME, "css": CSS} if _STYLE_IN_LAUNCH else {}
+
+
+with gr.Blocks(title="SAP Inventory Intelligence", **_blocks_kwargs) as demo:
+
+    gr.HTML(HEADER_HTML)
+
+    file_state = gr.State(None)
+    id_state = gr.State(None)
+
+    with gr.Tabs():
+
+        # -------------------------------------------------
+        # TAB 1  -  ON-DEMAND REPORTS
+        #   left: request + e-mail   |   right: dashboard
+        # -------------------------------------------------
+        with gr.Tab("On-demand Reports"):
+
+            with gr.Row(equal_height=False):
+
+                # ---- left control column ----
+                with gr.Column(scale=4, min_width=360):
+
+                    with gr.Column(elem_classes="card"):
+                        section(
+                            "New report",
+                            "Ask a question about stock, plants or materials."
+                        )
+
+                        question_input = gr.Textbox(
+                            label="Inventory question",
+                            placeholder=(
+                                "Example: Analyse material stock risk across "
+                                "all plants and show a donut chart and a "
+                                "bar chart."
+                            ),
+                            lines=5,
+                        )
+
+                        format_input = gr.Dropdown(
+                            REPORT_FORMATS, value="PDF",
+                            label="Report format"
+                        )
+
+                        vendor_check_input = gr.Checkbox(
+                            label="Include vendor e-mail check (Gmail)",
+                            info=(
+                                "Checks the plant MRP controller mailbox "
+                                "for replenishment requests and vendor "
+                                "replies, and adds a supply-risk section."
+                            ),
+                            value=False,
+                        )
+
+                        with gr.Row():
+                            generate_button = gr.Button(
+                                "Generate report",
+                                variant="primary", scale=3
+                            )
+                            clear_button = gr.Button("Clear", scale=1)
+
+                        report_status = gr.Markdown(
+                            "Ready to generate a report.",
+                            elem_classes="status-line"
+                        )
+
+                    with gr.Column(elem_classes="card"):
+                        section(
+                            "Send by email",
+                            "Deliver the generated report through Gmail."
+                        )
+
+                        recipient_input = gr.Textbox(
+                            label="Recipient email(s)",
+                            placeholder="a@example.com, b@example.com"
+                        )
+                        subject_input = gr.Textbox(
+                            label="Subject", value=DEFAULT_SUBJECT
+                        )
+
+                        with gr.Accordion("Message", open=False):
+                            email_body_input = gr.Textbox(
+                                value=sched.DEFAULT_EMAIL_BODY,
+                                show_label=False, lines=4
+                            )
+
+                        send_email_button = gr.Button(
+                            "Send report via Gmail", variant="primary"
+                        )
+                        email_status = gr.Markdown(
+                            elem_classes="status-line"
+                        )
+
+                # ---- right dashboard column ----
+                with gr.Column(scale=9, min_width=520):
+
+                    with gr.Column(elem_classes="card"):
+                        section(
+                            "Inventory Intelligence Dashboard",
+                            "Generated report, charts and inventory position."
+                        )
+
+                        file_output = gr.File(label="Download report")
+
+                        report_output = gr.HTML(
+                            value=EMPTY_REPORT_HTML,
+                            elem_classes="report-pane"
+                        )
+
+        # -------------------------------------------------
+        # TAB 2  -  SCHEDULE REPORTS
+        #   three cards side by side, actions, table below
+        # -------------------------------------------------
+        with gr.Tab("Schedule Reports") as schedule_tab:
+
+            editing_id = gr.State("")
+
+            gr.HTML(
+                '<div class="sec-sub" style="margin:8px 2px 4px">'
+                'Create a schedule below, or <b>click a row</b> in the '
+                'schedules table to edit it.</div>'
+            )
+
+            with gr.Row(equal_height=False):
+
+                with gr.Column(scale=1, min_width=320, elem_classes="card"):
+                    section("1 · Report")
+
+                    s_name = gr.Textbox(
+                        label="Schedule name",
+                        placeholder="Weekly stock-risk review"
+                    )
+                    s_question = gr.Textbox(
+                        label="Inventory question to run",
+                        placeholder=(
+                            "Analyse stock risk for all plants and "
+                            "show a donut chart and a bar chart."
+                        ),
+                        lines=5
+                    )
+                    s_format = gr.Dropdown(
+                        REPORT_FORMATS, value="PDF",
+                        label="Report format"
+                    )
+                    s_vendor = gr.Checkbox(
+                        label="Include vendor e-mail check (Gmail)",
+                        value=False,
+                    )
+
+                with gr.Column(scale=1, min_width=320, elem_classes="card"):
+                    section("2 · Delivery")
+
+                    s_recipients = gr.Textbox(
+                        label="Recipients (comma, semicolon or new line)",
+                        lines=3,
+                        placeholder=(
+                            "planner1@example.com, planner2@example.com"
+                        )
+                    )
+                    s_subject = gr.Textbox(
+                        label="Email subject", value=DEFAULT_SUBJECT
+                    )
+
+                    with gr.Accordion("Email message (optional)", open=False):
+                        s_body = gr.Textbox(
+                            value=sched.DEFAULT_EMAIL_BODY,
+                            show_label=False, lines=4
+                        )
+
+                with gr.Column(scale=1, min_width=340, elem_classes="card"):
+                    section("3 · Timing")
+
+                    s_tz = gr.Dropdown(
+                        sched.TIMEZONES, value=DEFAULT_TZ,
+                        label="Timezone", filterable=True
+                    )
+                    s_recurrence = gr.Radio(
+                        sched.RECURRENCES, value="Everyday",
+                        label="Recurrence"
+                    )
+
+                    s_time = gr.Textbox(
+                        label="Run at (24-hour HH:MM)",
+                        value="08:00"
+                    )
+
+                    with gr.Column(visible=False) as custom_group:
+                        gr.HTML(
+                            '<div class="sec-sub">Tick the days and set a '
+                            'time for each (24-hour HH:MM).</div>'
+                        )
+
+                        day_checks, day_times = [], []
+
+                        for label in sched.DAY_LABELS:
+                            with gr.Row(elem_classes="day-row"):
+                                day_checks.append(
+                                    gr.Checkbox(label=label, scale=3,
+                                                min_width=120)
+                                )
+                                day_times.append(
+                                    gr.Textbox(
+                                        value="08:00",
+                                        show_label=False,
+                                        container=False,
+                                        scale=2, min_width=80
+                                    )
+                                )
+
+            with gr.Row():
+                save_btn = gr.Button("Save schedule", variant="primary",
+                                     scale=2)
+                new_btn = gr.Button("New schedule", scale=1)
+                run_btn = gr.Button("Run selected now", scale=1)
+                cancel_btn = gr.Button("Cancel selected schedule",
+                                       variant="stop", scale=1)
+                refresh_sched_btn = gr.Button("Refresh", scale=1)
+
+            schedule_status = gr.Markdown(elem_classes="status-line")
+
+            with gr.Column(elem_classes="card"):
+                section("Schedules", "Click a row to edit, run or cancel it.")
+
+                schedules_df = gr.Dataframe(
+                    headers=SCHEDULE_HEADERS,
+                    value=schedules_table,
+                    interactive=False,
+                    wrap=True,
+                    show_label=False,
+                )
+
+        # -------------------------------------------------
+        # TAB 3  -  GENERATED REPORTS
+        #   filter bar on top, table left, details right
+        # -------------------------------------------------
+        with gr.Tab("Generated Reports") as reports_tab:
+
+            with gr.Column(elem_classes="card"):
+                with gr.Row():
+                    f_search = gr.Textbox(
+                        label="Search (ID, name or request)", scale=4,
+                        placeholder="Type to search and press Enter"
+                    )
+                    f_type = gr.Dropdown(
+                        ["All", "On-demand", "Scheduled"], value="All",
+                        label="Type", scale=1, min_width=140
+                    )
+                    f_status = gr.Dropdown(
+                        ["All", "Success", "Failed", "Running"], value="All",
+                        label="Status", scale=1, min_width=140
+                    )
+                    f_refresh = gr.Button("Refresh", scale=1, min_width=110)
+
+            with gr.Row(equal_height=False):
+
+                with gr.Column(scale=8, min_width=520, elem_classes="card"):
+                    section("Reports", "Click a row to select a report.")
+
+                    reports_df = gr.Dataframe(
+                        headers=REPORT_HEADERS,
+                        value=lambda: reports_table("", "All", "All"),
+                        interactive=False,
+                        wrap=True,
+                        show_label=False,
+                    )
+
+                with gr.Column(scale=3, min_width=300, elem_classes="card"):
+                    section("Selected report")
+
+                    report_details = gr.Markdown(
+                        "Select a report from the list.",
+                        elem_classes="detail-box"
+                    )
+                    report_download = gr.File(label="Download report")
+
+    # =====================================================
+    # EVENTS  (unchanged)
+    # =====================================================
+
+    # ---- Tab 1 ------------------------------------------
 
     generate_button.click(
         fn=generate_report,
-        inputs=[question_input],
+        inputs=[question_input, format_input, vendor_check_input],
         outputs=[
-            report_output,
-            pdf_output,
-            pdf_state,
-            report_state,
-            report_status
-        ]
+            report_output, file_output, file_state,
+            id_state, report_status
+        ],
     )
-
-    # -----------------------------------------------------
-    # SEND EMAIL
-    # -----------------------------------------------------
 
     send_email_button.click(
         fn=send_email,
         inputs=[
-            recipient_input,
-            subject_input,
-            email_body_input,
-            pdf_state
+            recipient_input, subject_input, email_body_input,
+            file_state, id_state
         ],
-        outputs=[email_status]
+        outputs=[email_status],
     )
-
-    # -----------------------------------------------------
-    # CLEAR
-    # -----------------------------------------------------
 
     clear_button.click(
         fn=clear_report,
         inputs=[],
         outputs=[
-            question_input,
-            pdf_output,
-            pdf_state,
-            report_state,
-            report_output,
-            report_status
-        ]
+            question_input, file_output, file_state, id_state,
+            report_output, report_status
+        ],
+    )
+
+    # ---- Tab 2 ------------------------------------------
+
+    form_outputs = [
+        editing_id, s_name, s_question, s_recipients, s_subject, s_body,
+        s_tz, s_format, s_recurrence, s_time,
+        *day_checks, *day_times, s_vendor,
+    ]
+
+    s_recurrence.change(
+        toggle_recurrence,
+        inputs=[s_recurrence],
+        outputs=[s_time, custom_group],
+    )
+
+    save_btn.click(
+        save_schedule,
+        inputs=form_outputs,
+        outputs=[editing_id, schedule_status, schedules_df],
+    )
+
+    new_btn.click(new_schedule, outputs=[*form_outputs, schedule_status])
+
+    schedules_df.select(
+        load_schedule,
+        inputs=[schedules_df],
+        outputs=[*form_outputs, schedule_status],
+    )
+
+    cancel_btn.click(
+        cancel_schedule,
+        inputs=[editing_id],
+        outputs=[schedule_status, schedules_df],
+    )
+
+    run_btn.click(
+        run_selected_now,
+        inputs=[editing_id],
+        outputs=[schedule_status],
+    )
+
+    refresh_sched_btn.click(schedules_table, outputs=[schedules_df])
+    schedule_tab.select(schedules_table, outputs=[schedules_df])
+
+    # ---- Tab 3 ------------------------------------------
+
+    filter_inputs = [f_search, f_type, f_status]
+
+    for trigger in (
+        f_search.submit, f_type.change, f_status.change, f_refresh.click
+    ):
+        trigger(reports_table, inputs=filter_inputs, outputs=[reports_df])
+
+    reports_tab.select(
+        reports_table, inputs=filter_inputs, outputs=[reports_df]
+    )
+
+    reports_df.select(
+        select_report,
+        inputs=[reports_df],
+        outputs=[report_download, report_details],
     )
 
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    # Start the scheduler ONCE, in the process that serves the UI.
+    sched.start()
+
+    demo.queue().launch(
+        allowed_paths=[str(store.REPORTS_DIR)],
+        **_launch_kwargs,
+    )

@@ -59,10 +59,6 @@ print("Gemini model:", GEMINI_MODEL)
 # DATA AGENT TOOLSET
 # ---------------------------------------------------------
 
-credentials, detected_project = google.auth.default(
-    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-
 data_agent_credentials = DataAgentCredentialsConfig(
     credentials=credentials
 )
@@ -76,11 +72,6 @@ data_agent_config = DataAgentToolConfig(
 bigquery_toolset = DataAgentToolset(
     credentials_config=data_agent_credentials,
     data_agent_tool_config=data_agent_config,
-    tool_filter=[
-        "list_accessible_data_agents",
-        "get_data_agent_info",
-        "ask_data_agent",
-    ],
 )
 
 # ---------------------------------------------------------

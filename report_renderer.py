@@ -549,7 +549,7 @@ def render_table(table):
                     value = None
 
             # Special styling for risk column
-            if str(column).lower() == "risk":
+            if str(column).lower() in ("risk", "supply_risk", "stock_risk"):
 
                 risk_value = str(value or "").lower()
 
@@ -559,7 +559,7 @@ def render_table(table):
                 elif "high" in risk_value:
                     css_class = "mrp-risk-high"
 
-                elif "normal" in risk_value:
+                elif "normal" in risk_value or "low" in risk_value:
                     css_class = "mrp-risk-normal"
 
                 else:
@@ -1364,6 +1364,46 @@ def render_report_html(report):
         parts.append(
             "</div>"
         )
+
+    # -----------------------------------------------------
+    # VENDOR RESPONSE & SUPPLY RISK (only when vendor check was run)
+    # -----------------------------------------------------
+
+    followups = report.get("vendor_followups")
+    vendor_summary = report.get("vendor_summary") or {}
+
+    if followups:
+
+        vendor_columns = [
+            "material_number", "plant", "stock_risk", "vendor",
+            "request_sent", "reply_status", "hours_waiting",
+            "reply_outcome", "supply_risk", "assessment",
+        ]
+
+        parts.append(
+            '<div class="mrp-section">'
+            "<h3>Vendor Response &amp; Supply Risk</h3>"
+            '<p class="mrp-empty">'
+            f"{esc(vendor_summary.get('checked', 0))} materials checked "
+            "against the MRP controller mailbox: "
+            f"{esc(vendor_summary.get('critical', 0))} Critical, "
+            f"{esc(vendor_summary.get('high', 0))} High, "
+            f"{esc(vendor_summary.get('medium', 0))} Medium, "
+            f"{esc(vendor_summary.get('low', 0))} Low supply risk."
+            "</p>"
+        )
+
+        parts.append(
+            render_table({
+                "columns": vendor_columns,
+                "rows": [
+                    {k: row.get(k) for k in vendor_columns}
+                    for row in followups
+                ],
+            })
+        )
+
+        parts.append("</div>")
 
     # -----------------------------------------------------
     # MRP RECOMMENDATIONS

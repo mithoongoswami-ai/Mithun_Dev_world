@@ -21,6 +21,7 @@ from reportlab.platypus import (
 )
 
 from report_renderer import chart_png_bytes
+from report_store import REPORTS_DIR
 
 
 def safe_text(value):
@@ -115,7 +116,7 @@ def add_bullets(story, items, styles):
         )
 
 
-def create_dynamic_table(columns, rows, styles):
+def create_dynamic_table(columns, rows, styles, col_weights=None):
     if not columns or not rows:
         return None
 
@@ -143,11 +144,15 @@ def create_dynamic_table(columns, rows, styles):
         data.append(cells)
 
     page_width = landscape(A4)[0] - 25 * mm
-    col_width = page_width / len(columns)
+    if col_weights:
+        total = float(sum(col_weights))
+        col_widths = [page_width * w / total for w in col_weights]
+    else:
+        col_widths = [page_width / len(columns)] * len(columns)
 
     table = Table(
         data,
-        colWidths=[col_width] * len(columns),
+        colWidths=col_widths,
         repeatRows=1,
         hAlign="LEFT",
     )
@@ -191,8 +196,8 @@ def footer(canvas, document):
     canvas.restoreState()
 
 
-def generate_pdf_report(report):
-    output_dir = "generated_reports"
+def generate_pdf_report(report, output_dir=None):
+    output_dir = str(output_dir or REPORTS_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -386,6 +391,36 @@ def generate_pdf_report(report):
 
         if table:
             story.append(table)
+
+    # -----------------------------------------------------
+    # VENDOR RESPONSE & SUPPLY RISK (only when vendor check was run)
+    # -----------------------------------------------------
+
+    followups = report.get("vendor_followups")
+
+    if followups:
+        story.append(PageBreak())
+
+        story.append(Paragraph(
+            "Vendor Response &amp; Supply Risk",
+            styles["MRPSection"]
+        ))
+
+        vendor_columns = [
+            "material_number", "plant", "stock_risk", "vendor",
+            "request_sent", "reply_status", "hours_waiting",
+            "reply_outcome", "supply_risk", "assessment",
+        ]
+
+        vendor_table = create_dynamic_table(
+            vendor_columns,
+            followups,
+            styles,
+            col_weights=[1.2, 0.7, 0.9, 1.6, 1.3, 1.1, 0.8, 1.0, 0.9, 4.5]
+        )
+
+        if vendor_table:
+            story.append(vendor_table)
 
     # -----------------------------------------------------
     # RECOMMENDATIONS
